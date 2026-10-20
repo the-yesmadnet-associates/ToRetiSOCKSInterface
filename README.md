@@ -11,6 +11,8 @@ It is based on `SOCKSClientInterface.py` by Kevin Steen
 ([SkyGuy on Codeberg](https://codeberg.org/SkyGuy/reti_socks_client)). The first versions were
 simple modifications - later most of the code was rewritten.
 
+We wanted to offer a thoroughly tested and reliable alternative, so users don’t have to risk running freshly thrown-together or untrusted interfaces that could leak IPs or cause other problems.
+
 ## How is it different?
 
 Let's pop the hood and look under it.
