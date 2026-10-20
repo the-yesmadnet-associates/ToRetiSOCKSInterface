@@ -1,0 +1,31 @@
+ToRetiSOCKSInterface is a community-driven derivative.
+
+Original design & implementation (SOCKSClientInterface):
+  - Kevin Steen <code at kevinsteen.net>
+  - Source: https://codeberg.org/SkyGuy/reti_socks_client/src/branch/main/SOCKSClientInterface.py
+
+Modifications, Tor fine-tuning, and testing:
+  - ToRnadoTamer  (initial modifications, Tor tuning and testing)
+  - Shroomsaman   (core code rewrite and optimization)
+  - Popojoker     (testing and gateway validation)
+
+Gateways used for testing:
+  - Popojoker_Buttcave_Nexus_4Catwoman (IPv4)
+  - Toreticulum Gateway (Tor-only gateway, onion-based)
+  - Popojoker_Buttcave_Nexus_Toreador (onion-based)
+  - ...and others
+
+Built on Reticulum by Mark Qvist: https://reticulum.network/
+
+About "The Yesmadnet Associates":
+  An informal group of the contributors listed above. It is not a company
+  or a legal entity. Each contributor keeps the copyright in their own
+  contributions, and all contributions are released under the
+  AGPL-3.0-or-later (see LICENSE). No warranty, no support promises.
+
+Contact (LXMF):
+  ToRnadoTamer  <7449a0154f0766eaad30e07368eea752>
+  Popojoker     <b53e5aa5e0d67b8424c62ceeb57e1eff>
+  Shroomsaman   <9d390470465ea9a35130ffe8d38af0a5>
+
+The Yesmadnet Associates
