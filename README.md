@@ -110,9 +110,3 @@ Copyright 2025 Kevin Steen, copyright 2026 The Yesmadnet Associates (see `CREDIT
 Based on `SOCKSClientInterface.py` by Kevin Steen: https://codeberg.org/SkyGuy/reti_socks_client
 
 This project is not affiliated with Reticulum, NomadNet, Tor or RetiNet.
-
-## Changelog
-
-**2.4-tor** (October 2026), initial public release. Check the `What we changed` section.
-
-**1.1.202503**: the original SOCKSClientInterface by Kevin Steen.
