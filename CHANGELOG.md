@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## 2.5-tor
+
+Security-related improvements and stricter SOCKS5 stream isolation enforcement.
+
+### Added
+- Added configurable Reticulum tunnel synthesis via the new `tunnel` option (enabled by default).
+- Added incoming HDLC frame length validation to reject undersized and oversized frames.
+- Added an `invalid_frames` counter to interface status reporting.
+- Added configuration validation for bitrate, MTU, buffer sizes, keepalive settings, and reconnect delays.
+
+### Changed
+- Increased the default IFAC size from 8 to 16 bytes.
+- Enforced SOCKS5 stream isolation when `isolate = yes`. Connections now fail when the proxy does not support username/password authentication, instead of silently continuing without isolation.
+- Updated the configuration documentation to include the new `tunnel` option.
+
+### Fixed
+- Clear incomplete incoming frame data after reconnection to prevent stale data from being processed as part of a new connection.
+- Improved handling of invalid incoming frames and connection recovery.
+
+---
+
 ## v2.4-tor - 2026-10-20
 
 This first public community publication.
