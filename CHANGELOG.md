@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## 2.5-tor
+## v2.5-tor - 2026-10-24
 
 Security-related improvements and stricter SOCKS5 stream isolation enforcement.
 
