@@ -33,8 +33,8 @@ compliant SOCKS5 proxy by changing proxy_port / isolate / bitrate.
 
 Required: target_host, target_port
 Optional: proxy_host (127.0.0.1), proxy_port (9050), isolate (yes),
-          bitrate (20_000_000), connect_timeout (20), hw_mtu, and various
-          buffer/keepalive knobs.
+          bitrate (20_000_000), connect_timeout (20), tunnel (yes), hw_mtu,
+          and various buffer/keepalive knobs.
 
 Note: the MTU is derived from `bitrate`. 20 Mbit/s (MTU 16384) seemed to be a
 good fit during our tests, but feel free to experiment.
@@ -54,7 +54,7 @@ Example (clearnet host, reached through the proxy):
       target_port = 4242
 """
 
-__version__ = '2.4-tor'
+__version__ = '2.5-tor'
 
 import random
 import socket
@@ -172,7 +172,7 @@ class HDLC():
 
 
 class ToRetiSOCKSInterface(Interface):
-    DEFAULT_IFAC_SIZE = 8
+    DEFAULT_IFAC_SIZE = 16
     AUTOCONFIGURE_MTU = True
 
     name = "Unnamed ToRetiSOCKSInterface"
@@ -187,6 +187,7 @@ class ToRetiSOCKSInterface(Interface):
         self.incoming_buffer = bytearray()
         self._socket_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
+        self._invalid_frames = 0
         self._generation = 0
 
         self.reconnect_count = 0
@@ -206,6 +207,7 @@ class ToRetiSOCKSInterface(Interface):
                                   "target_port must be a valid port number")
         self.proxy_port = getint(config, 'proxy_port', DEFAULT_PROXY_PORT,
                                  "proxy_port must be a valid port number")
+        self.tunnel = getbool(config, 'tunnel', True)
         self.connect_timeout = getfloat(config, 'connect_timeout', CONNECT_TIMEOUT,
                                         "connect_timeout must be a number")
         if self.connect_timeout <= 0:
@@ -250,6 +252,20 @@ class ToRetiSOCKSInterface(Interface):
                                       "keepalive_count must be an integer")
         self._reconnect_delay = self.min_reconnect_delay
 
+        if self.bitrate < RNS.Reticulum.MINIMUM_BITRATE:
+            raise ValueError(f"bitrate must be at least {RNS.Reticulum.MINIMUM_BITRATE}")
+        if self.HW_MTU < RNS.Reticulum.MTU:
+            raise ValueError(f"hw_mtu of {self.HW_MTU} bytes is too small "
+                             f"(minimum {RNS.Reticulum.MTU})")
+        for name in ('recv_buffer_size', 'socket_buffer_bytes', 'max_incoming_buffer',
+                     'keepalive_idle', 'keepalive_interval', 'keepalive_count'):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be greater than 0")
+        if self.min_reconnect_delay <= 0:
+            raise ValueError("min_reconnect_delay must be greater than 0")
+        if self.max_reconnect_delay < self.min_reconnect_delay:
+            raise ValueError("max_reconnect_delay must not be smaller than min_reconnect_delay")
+
         target_host_bytes = self.target_host.encode()
         if len(target_host_bytes) > SOCKS5_MAX_FIELD_LEN:
             raise ValueError("target_host name too long (max 255 bytes)")
@@ -268,6 +284,7 @@ class ToRetiSOCKSInterface(Interface):
             "reconnect_count": self.reconnect_count,
             "last_connected_at": self.last_connected_at,
             "last_disconnected_at": self.last_disconnected_at,
+            "invalid_frames": self._invalid_frames,
         }
 
     def __repr__(self):
@@ -366,7 +383,28 @@ class ToRetiSOCKSInterface(Interface):
 
         self.incoming_buffer = bytearray(extra)
         for pkt in pkts:
+            if not self._check_frame_len(len(pkt)):
+                self._invalid_frames += 1
+                log_debug(f"{self}: dropping invalid frame of {len(pkt)} bytes")
+                continue
             self.process_incoming(pkt)
+
+    def _synthesize_tunnel(self, gen):
+        for _ in range(40):
+            if getattr(RNS.Transport, 'identity', None) is not None:
+                break
+            if not (self.running and gen == self._generation):
+                return
+            time.sleep(0.5)
+        else:
+            return
+        if self.online and gen == self._generation:
+            RNS.Transport.synthesize_tunnel(self)
+
+    def _check_frame_len(self, frame_len):
+        if frame_len <= RNS.Reticulum.HEADER_MINSIZE:
+            return False
+        return frame_len <= self.HW_MTU + (getattr(self, 'ifac_size', 0) or 0)
 
     def _next_delay(self):
         jitter = self._reconnect_delay * RECONNECT_JITTER
@@ -409,11 +447,15 @@ class ToRetiSOCKSInterface(Interface):
 
             if not (self.running and gen == self._generation):
                 return  # stopped (or replaced) while connecting
+            self.incoming_buffer = bytearray()  # drop a partial frame left over from the previous connection
             self.online = True
             if not (self.running and gen == self._generation):
                 self.online = False  # stop() raced us between the check and the assignment
                 return
             self.last_connected_at = time.time()
+            if self.tunnel:
+                threading.Thread(target=self._synthesize_tunnel, args=(gen,),
+                                 name="%s tunnel" % type(self).__name__, daemon=True).start()
             if self._ever_connected:
                 self.reconnect_count += 1
                 log_info(f"{self} reconnected (reconnect #{self.reconnect_count})")
@@ -506,8 +548,9 @@ class ToRetiSOCKSInterface(Interface):
             self._do_userpass_auth()
         elif chosen == SOCKS5_AUTH_NONE:
             if self.isolate:
-                log_warning(f"{self}: proxy does not support username/"
-                            f"password auth; continuing without stream isolation")
+                raise IOError("proxy does not support username/password auth, which "
+                              "stream isolation (isolate = yes) requires; set "
+                              "isolate = no to connect without isolation")
         else:
             raise IOError(f"Proxy rejected all offered auth methods "
                           f"(response: {method_resp!r})")
