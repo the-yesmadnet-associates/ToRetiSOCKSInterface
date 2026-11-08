@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## v2.5.1-tor - 2026-11-08
+
+Robustness and configuration-validation release. No wire-format changes.
+
+### Added
+- Added the `fixed_mtu` option. `hw_mtu` remains as a legacy alias; conflicting values are rejected.
+- Added `detach()` support. A detached interface stays stopped and is never restarted.
+- Added IDNA encoding and validation of `target_host`.
+- Added validation of the reserved byte in SOCKS5 replies.
+
+### Changed
+- Boolean options are now parsed strictly. Invalid values (for example a typo in `isolate`) are rejected instead of silently evaluating to false.
+- With `isolate = yes`, only username/password authentication is offered. A proxy selecting no-auth or answering 0xFF now produces a distinct, descriptive error.
+- A configured MTU (`fixed_mtu` / `hw_mtu`) now disables automatic MTU optimisation. Bitrates too low for an automatic MTU fall back to Reticulum's minimum MTU instead of failing.
+- `bitrate` only needs to be greater than 0, and numeric options now reject non-finite values (nan/inf).
+- Tunnel synthesis now waits for Reticulum's Transport to be ready, requires the interface to be registered, and is coordinated with Reticulum's own startup synthesis. This requires a Reticulum version that provides `Transport.ready` (tested with Reticulum 1.6.0).
+
+### Fixed
+- `online` and `last_disconnected_at` are now updated on every failure path, so the reported state no longer lags behind a failed connection.
+- Unexpected errors while receiving or processing data (including errors raised by the transport) now restart the interface instead of silently ending the read thread.
+- Socket references are cleared on stop and after failed connection attempts, and sending or receiving on a stopped or detached interface is a no-op.
+
+---
+
 ## v2.5-tor - 2026-10-24
 
 Security-related improvements and stricter SOCKS5 stream isolation enforcement.
