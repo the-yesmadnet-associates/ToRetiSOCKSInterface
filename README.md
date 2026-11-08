@@ -1,6 +1,6 @@
 # ToRetiSOCKSInterface
 
-*Version 2.5-tor - October 2026*
+*Version 2.5.1-tor - November 2026*
 
 SOCKS5 client interface for [Reticulum](https://reticulum.network/), tuned for Tor.
 Tested and used on the ToReticuLoki Gateways, the Buttcave Nexus and a few other gateways.
