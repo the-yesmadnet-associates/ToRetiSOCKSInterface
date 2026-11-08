@@ -33,8 +33,8 @@ compliant SOCKS5 proxy by changing proxy_port / isolate / bitrate.
 
 Required: target_host, target_port
 Optional: proxy_host (127.0.0.1), proxy_port (9050), isolate (yes),
-          bitrate (20_000_000), connect_timeout (20), tunnel (yes), hw_mtu,
-          and various buffer/keepalive knobs.
+          bitrate (20_000_000), connect_timeout (20), tunnel (yes), hw_mtu or
+          fixed_mtu, and various buffer/keepalive knobs.
 
 Note: the MTU is derived from `bitrate`. 20 Mbit/s (MTU 16384) seemed to be a
 good fit during our tests, but feel free to experiment.
@@ -54,8 +54,9 @@ Example (clearnet host, reached through the proxy):
       target_port = 4242
 """
 
-__version__ = '2.5-tor'
+__version__ = '2.5.1-tor'
 
+import math
 import random
 import socket
 import threading
@@ -131,7 +132,12 @@ def getbool(coll, key, default):
     val = coll.get(key, default)
     if isinstance(val, bool):
         return val
-    return str(val).strip().lower() in ('yes', 'true', '1', 'on')
+    value = str(val).strip().lower()
+    if value in ('yes', 'true', '1', 'on'):
+        return True
+    if value in ('no', 'false', '0', 'off'):
+        return False
+    raise ValueError(f"{key} must be a boolean (yes/no, true/false, 1/0, or on/off)")
 
 
 class HDLC():
@@ -184,10 +190,17 @@ class ToRetiSOCKSInterface(Interface):
     def __init__(self, owner, config):
         super().__init__()
         self.owner = owner
+        self.IN = True
+        self.OUT = False
+        self.receives = True
+        self.mode = Interface.MODE_FULL
+        self.detached = False
+        self.running = False
+        self.online = False
         self.incoming_buffer = bytearray()
+        self._invalid_frames = 0
         self._socket_lock = threading.Lock()
         self._lifecycle_lock = threading.RLock()
-        self._invalid_frames = 0
         self._generation = 0
 
         self.reconnect_count = 0
@@ -207,24 +220,50 @@ class ToRetiSOCKSInterface(Interface):
                                   "target_port must be a valid port number")
         self.proxy_port = getint(config, 'proxy_port', DEFAULT_PROXY_PORT,
                                  "proxy_port must be a valid port number")
-        self.tunnel = getbool(config, 'tunnel', True)
         self.connect_timeout = getfloat(config, 'connect_timeout', CONNECT_TIMEOUT,
                                         "connect_timeout must be a number")
-        if self.connect_timeout <= 0:
-            raise ValueError("connect_timeout must be greater than 0")
+        if not math.isfinite(self.connect_timeout) or self.connect_timeout <= 0:
+            raise ValueError("connect_timeout must be a finite number greater than 0")
         for portname, portval in (('target_port', self.target_port),
                                   ('proxy_port', self.proxy_port)):
             if not (0 < portval <= 65535):
                 raise ValueError(f"{portname} must be between 1 and 65535")
 
+        self.tunnel = getbool(config, 'tunnel', True)
+        self.wants_tunnel = self.tunnel
+
         self.bitrate = getint(config, 'bitrate', DEFAULT_BITRATE,
                               "bitrate must be a valid integer")
-        self.optimise_mtu()
-        if self.HW_MTU is None:
-            self.HW_MTU = RNS.Reticulum.MTU
+        if self.bitrate <= 0:
+            raise ValueError("bitrate must be greater than 0")
+
+        configured_mtu = None
+        if 'fixed_mtu' in config:
+            configured_mtu = getint(config, 'fixed_mtu', None,
+                                    "fixed_mtu must be a valid integer")
         if 'hw_mtu' in config:
-            self.HW_MTU = getint(config, 'hw_mtu', self.HW_MTU,
-                                 "hw_mtu must be a valid integer")
+            legacy_mtu = getint(config, 'hw_mtu', None,
+                                "hw_mtu must be a valid integer")
+            if configured_mtu is not None and configured_mtu != legacy_mtu:
+                raise ValueError("fixed_mtu and hw_mtu specify different values")
+            if configured_mtu is None:
+                configured_mtu = legacy_mtu
+
+        if configured_mtu is not None:
+            if configured_mtu < RNS.Reticulum.MTU:
+                raise ValueError(
+                    f"configured MTU of {configured_mtu} bytes is smaller than "
+                    f"Reticulum's minimum MTU of {RNS.Reticulum.MTU}")
+            self.HW_MTU = configured_mtu
+            self.AUTOCONFIGURE_MTU = False
+            self.FIXED_MTU = True
+        else:
+            self.optimise_mtu()
+            if self.HW_MTU is None:
+                self.HW_MTU = RNS.Reticulum.MTU
+                self.AUTOCONFIGURE_MTU = False
+                self.FIXED_MTU = True
+
         self.isolate = getbool(config, 'isolate', True)
         self.recv_buffer_size = getint(config, 'recv_buffer_size',
                                        DEFAULT_RECV_BUFFER_SIZE,
@@ -252,21 +291,22 @@ class ToRetiSOCKSInterface(Interface):
                                       "keepalive_count must be an integer")
         self._reconnect_delay = self.min_reconnect_delay
 
-        if self.bitrate < RNS.Reticulum.MINIMUM_BITRATE:
-            raise ValueError(f"bitrate must be at least {RNS.Reticulum.MINIMUM_BITRATE}")
-        if self.HW_MTU < RNS.Reticulum.MTU:
-            raise ValueError(f"hw_mtu of {self.HW_MTU} bytes is too small "
-                             f"(minimum {RNS.Reticulum.MTU})")
-        for name in ('recv_buffer_size', 'socket_buffer_bytes', 'max_incoming_buffer',
-                     'keepalive_idle', 'keepalive_interval', 'keepalive_count'):
+        for name in ('recv_buffer_size', 'socket_buffer_bytes',
+                     'max_incoming_buffer', 'keepalive_idle',
+                     'keepalive_interval', 'keepalive_count'):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be greater than 0")
-        if self.min_reconnect_delay <= 0:
-            raise ValueError("min_reconnect_delay must be greater than 0")
-        if self.max_reconnect_delay < self.min_reconnect_delay:
-            raise ValueError("max_reconnect_delay must not be smaller than min_reconnect_delay")
+        if not math.isfinite(self.min_reconnect_delay) or self.min_reconnect_delay <= 0:
+            raise ValueError("min_reconnect_delay must be finite and greater than 0")
+        if not math.isfinite(self.max_reconnect_delay) or self.max_reconnect_delay < self.min_reconnect_delay:
+            raise ValueError("max_reconnect_delay must be finite and no smaller than min_reconnect_delay")
+        if self.HW_MTU < RNS.Reticulum.MTU:
+            raise ValueError(f"hw_mtu of {self.HW_MTU} bytes is too small (minimum {RNS.Reticulum.MTU})")
 
-        target_host_bytes = self.target_host.encode()
+        try:
+            target_host_bytes = self.target_host.encode('idna')
+        except UnicodeError as e:
+            raise ValueError(f"target_host is not a valid hostname: {e}")
         if len(target_host_bytes) > SOCKS5_MAX_FIELD_LEN:
             raise ValueError("target_host name too long (max 255 bytes)")
         if self.isolate:
@@ -292,6 +332,9 @@ class ToRetiSOCKSInterface(Interface):
 
     def start(self):
         with self._lifecycle_lock:
+            if self.detached:
+                log_debug(f"{self}: start ignored because interface is detached")
+                return
             if self.running:
                 log_debug(f"{self}: start called when already running")
                 return
@@ -322,27 +365,42 @@ class ToRetiSOCKSInterface(Interface):
                         sock.close()
                     except Exception as e:
                         log_debug(f"{self}: stop close exception: {e}")
+                    if self.socket is sock:
+                        self.socket = None
             run_thread, self._run_thread = self._run_thread, None
             if run_thread is not None and run_thread is not threading.current_thread():
                 run_thread.join(timeout=5)
 
+    def detach(self):
+        """Permanently detach this interface from Reticulum operation."""
+        with self._lifecycle_lock:
+            self.detached = True
+            self.wants_tunnel = False
+            self.IN = False
+            self.OUT = False
+            self.stop()
+
     def _restart_async(self):
+        if self.detached:
+            return
         threading.Thread(target=self._restart, args=(self._generation,),
                          name="ToRetiSOCKSInterface restart", daemon=True).start()
 
     def _restart(self, gen=None):
         with self._lifecycle_lock:
-            if gen is not None and gen != self._generation:
+            if self.detached or (gen is not None and gen != self._generation):
                 return  # another restart already replaced this run
             self.stop()
             self.start()
 
     def process_incoming(self, data):
+        if not data or not self.online or self.detached:
+            return
         self.rxb += len(data)
         self.owner.inbound(data, self)
 
     def process_outgoing(self, data):
-        if not self.online:
+        if not self.online or self.detached:
             log_debug(f"{self}: tried to send before ready")
             return
         framed = HDLC.encode(data)
@@ -358,8 +416,10 @@ class ToRetiSOCKSInterface(Interface):
                     totalsent += sent
                     self.txb += sent
         except (IOError, OSError):
-            if self.running:
+            if self.running and not self.detached:
                 self.running = False
+                self.online = False
+                self.last_disconnected_at = time.time()
                 log_warning(f"{self}: error sending data, restarting interface")
                 self._restart_async()
 
@@ -378,6 +438,8 @@ class ToRetiSOCKSInterface(Interface):
                         f"frame; restarting interface")
             self.incoming_buffer = bytearray()
             self.running = False
+            self.online = False
+            self.last_disconnected_at = time.time()
             self._restart_async()
             return
 
@@ -389,22 +451,29 @@ class ToRetiSOCKSInterface(Interface):
                 continue
             self.process_incoming(pkt)
 
-    def _synthesize_tunnel(self, gen):
-        for _ in range(40):
-            if getattr(RNS.Transport, 'identity', None) is not None:
-                break
-            if not (self.running and gen == self._generation):
-                return
-            time.sleep(0.5)
-        else:
-            return
-        if self.online and gen == self._generation:
-            RNS.Transport.synthesize_tunnel(self)
-
     def _check_frame_len(self, frame_len):
         if frame_len <= RNS.Reticulum.HEADER_MINSIZE:
             return False
         return frame_len <= self.HW_MTU + (getattr(self, 'ifac_size', 0) or 0)
+
+    def _synthesize_tunnel(self, gen):
+        """Wait for Transport startup before synthesising the tunnel."""
+        wait_limit = getattr(RNS.Transport, 'READY_WAIT', 60)
+        deadline = time.monotonic() + max(1, wait_limit)
+        while time.monotonic() < deadline:
+            if self.detached or not self.running or gen != self._generation:
+                return
+            if (getattr(RNS.Transport, 'ready', False)
+                    and getattr(RNS.Transport, 'identity', None) is not None
+                    and self in getattr(RNS.Transport, 'interfaces', [])):
+                if self.online and gen == self._generation and not self.detached:
+                    try:
+                        RNS.Transport.synthesize_tunnel(self)
+                    except Exception as e:
+                        log_warning(f"{self}: could not synthesise Reticulum tunnel: {e}")
+                return
+            time.sleep(0.25)
+        log_debug(f"{self}: Reticulum Transport was not ready for tunnel synthesis")
 
     def _next_delay(self):
         jitter = self._reconnect_delay * RECONNECT_JITTER
@@ -440,23 +509,24 @@ class ToRetiSOCKSInterface(Interface):
                         log_warning(f"{self}: connection failed, retrying in "
                                     f"~{self._reconnect_delay:.1f}s ({e})")
                     if new_socket is not None:
+                        with self._socket_lock:
+                            if self.socket is new_socket:
+                                self.socket = None
                         try:
                             new_socket.close()
                         except Exception:
                             pass
 
-            if not (self.running and gen == self._generation):
+            if not (self.running and gen == self._generation) or self.detached:
                 return  # stopped (or replaced) while connecting
             self.incoming_buffer = bytearray()  # drop a partial frame left over from the previous connection
+            was_connected = self._ever_connected
             self.online = True
-            if not (self.running and gen == self._generation):
+            if not (self.running and gen == self._generation) or self.detached:
                 self.online = False  # stop() raced us between the check and the assignment
                 return
             self.last_connected_at = time.time()
-            if self.tunnel:
-                threading.Thread(target=self._synthesize_tunnel, args=(gen,),
-                                 name="%s tunnel" % type(self).__name__, daemon=True).start()
-            if self._ever_connected:
+            if was_connected:
                 self.reconnect_count += 1
                 log_info(f"{self} reconnected (reconnect #{self.reconnect_count})")
             else:
@@ -464,12 +534,20 @@ class ToRetiSOCKSInterface(Interface):
                 log_info(f"{self} connected")
             self._reconnect_delay = self.min_reconnect_delay
 
+            if self.tunnel and (was_connected or getattr(RNS.Transport, 'ready', False)):
+                threading.Thread(target=self._synthesize_tunnel, args=(gen,),
+                                 name="ToRetiSOCKSInterface tunnel", daemon=True).start()
+
             self._read_loop()
         except Exception as e:
             log_error(f"{self}: run exception: {e}")
         finally:
             if gen == self._generation:
+                was_online = self.online
                 self.running = False
+                self.online = False
+                if was_online:
+                    self.last_disconnected_at = time.time()
 
     def _tune_socket(self, sock):
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
@@ -497,19 +575,40 @@ class ToRetiSOCKSInterface(Interface):
         while self.running:
             try:
                 data = self.socket.recv(self.recv_buffer_size)
-            except (IOError, OSError):
-                if self.running:
+            except (IOError, OSError) as e:
+                if self.running and not self.detached:
                     self.running = False
-                    log_warning(f"{self}: error reading data, restarting interface")
+                    self.online = False
+                    self.last_disconnected_at = time.time()
+                    log_warning(f"{self}: error reading data, restarting interface ({e})")
+                    self._restart_async()
+                return
+            except Exception as e:
+                if self.running and not self.detached:
+                    self.running = False
+                    self.online = False
+                    self.last_disconnected_at = time.time()
+                    log_error(f"{self}: unexpected read-loop error, restarting interface ({e})")
                     self._restart_async()
                 return
             if not data:
-                if self.running:
+                if self.running and not self.detached:
                     self.running = False
+                    self.online = False
+                    self.last_disconnected_at = time.time()
                     log_warning(f"{self}: stream ended, restarting interface")
                     self._restart_async()
                 return
-            self._handle_wire_data(data)
+            try:
+                self._handle_wire_data(data)
+            except Exception as e:
+                if self.running and not self.detached:
+                    self.running = False
+                    self.online = False
+                    self.last_disconnected_at = time.time()
+                    log_error(f"{self}: error processing incoming frame, restarting interface ({e})")
+                    self._restart_async()
+                return
 
     def _recv_exact(self, n):
         buf = b''
@@ -529,12 +628,12 @@ class ToRetiSOCKSInterface(Interface):
             return b'\x04' + socket.inet_pton(socket.AF_INET6, self.target_host)
         except OSError:
             pass
-        host_bytes = self.target_host.encode()
+        host_bytes = self.target_host.encode('idna')
         return b'\x03' + len(host_bytes).to_bytes(1, 'big') + host_bytes
 
     def _send_socks_handshake(self):
         if self.isolate:
-            methods = bytes([SOCKS5_AUTH_USERPASS, SOCKS5_AUTH_NONE])
+            methods = bytes([SOCKS5_AUTH_USERPASS])
         else:
             methods = bytes([SOCKS5_AUTH_NONE])
         self.socket.sendall(bytes([0x05, len(methods)]) + methods)
@@ -548,9 +647,12 @@ class ToRetiSOCKSInterface(Interface):
             self._do_userpass_auth()
         elif chosen == SOCKS5_AUTH_NONE:
             if self.isolate:
-                raise IOError("proxy does not support username/password auth, which "
-                              "stream isolation (isolate = yes) requires; set "
-                              "isolate = no to connect without isolation")
+                raise IOError("proxy selected no-auth, but stream isolation "
+                              "is required (isolate = yes)")
+        elif self.isolate and chosen == 0xFF:
+            raise IOError("proxy does not support username/password auth, which "
+                          "stream isolation (isolate = yes) requires; set "
+                          "isolate = no to connect without isolation")
         else:
             raise IOError(f"Proxy rejected all offered auth methods "
                           f"(response: {method_resp!r})")
@@ -558,7 +660,7 @@ class ToRetiSOCKSInterface(Interface):
         self._do_connect()
 
     def _do_userpass_auth(self):
-        username = self.target_host.encode() + b':' + str(self.target_port).encode()
+        username = self.target_host.encode('idna') + b':' + str(self.target_port).encode()
         password = b'reticulum'
         if len(username) > SOCKS5_MAX_FIELD_LEN:
             raise ValueError("SOCKS5 username field too long")
@@ -575,9 +677,11 @@ class ToRetiSOCKSInterface(Interface):
         self.socket.sendall(b'\x05\x01\x00' + dstaddr)
 
         header = self._recv_exact(4)
-        ver, rep, _rsv, atyp = header[0], header[1], header[2], header[3]
+        ver, rep, rsv, atyp = header[0], header[1], header[2], header[3]
         if ver != 0x05:
             raise IOError(f"Unexpected SOCKS version in reply: {ver}")
+        if rsv != 0x00:
+            raise IOError(f"Invalid reserved byte in SOCKS5 reply: {rsv}")
         if rep != 0x00:
             raise IOError(f"SOCKS5 CONNECT to {self.target_host}:{self.target_port} failed: "
                           f"{SOCKS5_REPLY.get(rep, 'unknown error')} (code 0x{rep:02X})")
